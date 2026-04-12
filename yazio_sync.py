@@ -235,9 +235,7 @@ def update_journal(page_id, nutrition):
         "Fat": {"number": nutrition["fat"]},
         "Fat Goal": {"number": nutrition["fat_goal"]},
     }
-    if nutrition.get("weight", 0) > 0:
-        properties["Weight"] = {"number": nutrition["weight"]}
-
+    # Weight comes from Garmin (scale sync), NOT from YAZIO
     return notion_update_page(page_id, properties)
 
 
