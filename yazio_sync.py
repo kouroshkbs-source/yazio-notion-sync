@@ -150,6 +150,15 @@ def create_food(name, yazio_id, nutrients_per_gram):
     carbs_100 = round(nutrients_per_gram.get("nutrient.carb", 0) * 100, 1)
     fat_100 = round(nutrients_per_gram.get("nutrient.fat", 0) * 100, 1)
 
+    # Sanity check: if values per 100g are absurdly high, YAZIO probably
+    # returned nutrients already per 100g instead of per gram
+    if cal_100 > 1500:  # No food has >1500 kcal per 100g (pure fat = 900)
+        print(f"    ⚠ Suspicious kcal/100g for '{name}': {cal_100} — YAZIO may have returned per-100g values, dividing by 100")
+        cal_100 = round(cal_100 / 100, 1)
+        prot_100 = round(prot_100 / 100, 1)
+        carbs_100 = round(carbs_100 / 100, 1)
+        fat_100 = round(fat_100 / 100, 1)
+
     props = {
         "Food Name": {"title": [{"text": {"content": name}}]},
         "YAZIO ID": {"rich_text": [{"text": {"content": yazio_id}}]},
