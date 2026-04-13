@@ -38,6 +38,7 @@ JOURNAL_DB = "2deda7da88db811f98f5f860d49af03d"
 FOOD_DB = "2deda7da88db818caa0bef2df3178e8b"
 CALCULATOR_DB = "2deda7da88db8101b4e0dd3f1d0ba0eb"
 TODAY_PAGE_ID = "2deda7da88db81c3bfc9dd213ebddd77"  # Fixed page in "Today" DB (not Journal)
+TODAY_VIEW_ID = "2deda7da-88db-81cc-bd58-000c3328fad0"  # "Today" view in Calculator DB
 
 # Meal mapping YAZIO -> Notion
 MEAL_MAP = {
@@ -171,20 +172,69 @@ def create_food(name, yazio_id, nutrients_per_gram):
     return notion_create_page(FOOD_DB, props)
 
 
+def normalize_food_if_needed(food_page):
+    """If a Food entry has Reference='1g', convert to 'per 100g' (multiply by 100)."""
+    props = food_page.get("properties", {})
+    ref_rt = props.get("Reference", {}).get("rich_text", [])
+    ref = ref_rt[0]["plain_text"] if ref_rt else ""
+
+    if ref == "1g":
+        old_cal = props.get("Calories", {}).get("number") or 0
+        old_prot = props.get("Protein", {}).get("number") or 0
+        old_carbs = props.get("Carbs", {}).get("number") or 0
+        old_fat = props.get("Fat", {}).get("number") or 0
+
+        notion_update_page(food_page["id"], {
+            "Calories": {"number": round(old_cal * 100, 1)},
+            "Protein": {"number": round(old_prot * 100, 1)},
+            "Carbs": {"number": round(old_carbs * 100, 1)},
+            "Fat": {"number": round(old_fat * 100, 1)},
+            "Reference": {"rich_text": [{"text": {"content": "per 100g"}}]},
+        })
+        print(f"    Normalized Food '{food_page['id'][:12]}...' from 1g to per 100g")
+        # Return updated values
+        return {
+            "calories": round(old_cal * 100, 1),
+            "protein": round(old_prot * 100, 1),
+            "carbs": round(old_carbs * 100, 1),
+            "fat": round(old_fat * 100, 1),
+        }
+    else:
+        return {
+            "calories": props.get("Calories", {}).get("number") or 0,
+            "protein": props.get("Protein", {}).get("number") or 0,
+            "carbs": props.get("Carbs", {}).get("number") or 0,
+            "fat": props.get("Fat", {}).get("number") or 0,
+        }
+
+
 def get_or_create_food(yazio_token, product_id):
-    """Find or create a Food entry for a YAZIO product."""
+    """Find or create a Food entry for a YAZIO product. Returns (page_id, macros_per_100g)."""
     existing = find_food_by_yazio_id(product_id)
     if existing:
-        return existing["id"]
+        macros = normalize_food_if_needed(existing)
+        return existing["id"], macros
 
     # Fetch from YAZIO and create
     product = yazio_get_product(yazio_token, product_id)
+    nutrients = product.get("nutrients", {})
     page = create_food(
         name=product.get("name", "Unknown"),
         yazio_id=product_id,
-        nutrients_per_gram=product.get("nutrients", {}),
+        nutrients_per_gram=nutrients,
     )
-    return page["id"]
+    # Return the per-100g values we just stored
+    cal_100 = round(nutrients.get("energy.energy", 0) * 100, 1)
+    prot_100 = round(nutrients.get("nutrient.protein", 0) * 100, 1)
+    carbs_100 = round(nutrients.get("nutrient.carb", 0) * 100, 1)
+    fat_100 = round(nutrients.get("nutrient.fat", 0) * 100, 1)
+    if cal_100 > 1500:
+        cal_100 = round(cal_100 / 100, 1)
+        prot_100 = round(prot_100 / 100, 1)
+        carbs_100 = round(carbs_100 / 100, 1)
+        fat_100 = round(fat_100 / 100, 1)
+    macros = {"calories": cal_100, "protein": prot_100, "carbs": carbs_100, "fat": fat_100}
+    return page["id"], macros
 
 
 # =============================================
@@ -209,12 +259,38 @@ def find_journal_page(target_date):
     return pages[0]["id"] if pages else None
 
 
-def create_calculator_entry(food_page_id, quantity, meal, yazio_item_id, intake_time):
-    """Create a Calculator entry."""
+def get_food_macros(food_page_id):
+    """Fetch macros (per 100g) from a Food page."""
+    r = requests.get(
+        f"{NOTION_API}/pages/{food_page_id}",
+        headers=NOTION_HEADERS,
+    )
+    r.raise_for_status()
+    props = r.json().get("properties", {})
+    return {
+        "calories": props.get("Calories", {}).get("number") or 0,
+        "protein": props.get("Protein", {}).get("number") or 0,
+        "carbs": props.get("Carbs", {}).get("number") or 0,
+        "fat": props.get("Fat", {}).get("number") or 0,
+    }
+
+
+def create_calculator_entry(food_page_id, quantity, meal, yazio_item_id, intake_time, food_macros=None):
+    """Create a Calculator entry with computed macro values."""
+    # Compute actual macros from per-100g values
+    if food_macros is None:
+        food_macros = get_food_macros(food_page_id)
+
+    factor = quantity / 100.0 if quantity else 0
+
     props = {
         " ": {"title": [{"text": {"content": ""}}]},
         "Food": {"relation": [{"id": food_page_id}]},
         "Quantity": {"number": quantity},
+        "Calories": {"number": round(food_macros["calories"] * factor, 1)},
+        "Protein": {"number": round(food_macros["protein"] * factor, 1)},
+        "Carbs": {"number": round(food_macros["carbs"] * factor, 1)},
+        "Fat": {"number": round(food_macros["fat"] * factor, 1)},
         "Meal": {"select": {"name": meal}},
         "YAZIO ID": {"rich_text": [{"text": {"content": yazio_item_id}}]},
         "Ate": {"checkbox": True},
@@ -231,6 +307,36 @@ def create_calculator_entry(food_page_id, quantity, meal, yazio_item_id, intake_
 # =============================================
 # JOURNAL update
 # =============================================
+
+def update_today_view_filter(target_date):
+    """Update the Calculator 'Today' view filter to show only target_date entries."""
+    try:
+        # Notion internal API for view updates isn't available via public API,
+        # so we use the collection query endpoint workaround:
+        # We update the advancedFilter on the view via the Notion API
+        # Note: This uses an undocumented endpoint that may change
+        r = requests.patch(
+            f"{NOTION_API}/databases/{CALCULATOR_DB}/views/{TODAY_VIEW_ID}",
+            headers=NOTION_HEADERS,
+            json={
+                "filter": {
+                    "and": [
+                        {
+                            "property": "Intake Time",
+                            "date": {"on_or_after": target_date}
+                        }
+                    ]
+                }
+            },
+        )
+        if r.status_code == 200:
+            print(f"    Today view filter updated to {target_date}")
+        else:
+            # Fallback: the filter was set via MCP and will need manual refresh
+            print(f"    Today view filter update skipped (API {r.status_code})")
+    except Exception as e:
+        print(f"    Today view filter update error: {e}")
+
 
 def update_journal(page_id, nutrition):
     """Update Journal with daily totals from YAZIO."""
@@ -301,7 +407,7 @@ def sync_date(target_date, yazio_token):
 
         # Get or create food
         try:
-            food_page_id = get_or_create_food(yazio_token, product_id)
+            food_page_id, food_macros = get_or_create_food(yazio_token, product_id)
         except Exception as e:
             print(f"    Food error ({product_id}): {e}")
             continue
@@ -314,6 +420,7 @@ def sync_date(target_date, yazio_token):
                 meal=meal_notion,
                 yazio_item_id=yazio_item_id,
                 intake_time=intake_time,
+                food_macros=food_macros,
             )
             created += 1
         except Exception as e:
@@ -382,6 +489,10 @@ def main():
     except Exception as e:
         print(f"  FAIL Login failed: {e}")
         sys.exit(1)
+
+    # Update Today view filter to today's date
+    today_str = date.today().isoformat()
+    update_today_view_filter(today_str)
 
     # Sync
     success = 0
