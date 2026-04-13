@@ -38,7 +38,6 @@ JOURNAL_DB = "2deda7da88db811f98f5f860d49af03d"
 FOOD_DB = "2deda7da88db818caa0bef2df3178e8b"
 CALCULATOR_DB = "2deda7da88db8101b4e0dd3f1d0ba0eb"
 TODAY_PAGE_ID = "2deda7da88db81c3bfc9dd213ebddd77"  # Fixed page in "Today" DB (not Journal)
-TODAY_VIEW_ID = "2deda7da-88db-81cc-bd58-000c3328fad0"  # "Today" view in Calculator DB
 
 # Meal mapping YAZIO -> Notion
 MEAL_MAP = {
@@ -308,34 +307,50 @@ def create_calculator_entry(food_page_id, quantity, meal, yazio_item_id, intake_
 # JOURNAL update
 # =============================================
 
-def update_today_view_filter(target_date):
-    """Update the Calculator 'Today' view filter to show only target_date entries."""
-    try:
-        # Notion internal API for view updates isn't available via public API,
-        # so we use the collection query endpoint workaround:
-        # We update the advancedFilter on the view via the Notion API
-        # Note: This uses an undocumented endpoint that may change
-        r = requests.patch(
-            f"{NOTION_API}/databases/{CALCULATOR_DB}/views/{TODAY_VIEW_ID}",
-            headers=NOTION_HEADERS,
-            json={
-                "filter": {
-                    "and": [
-                        {
-                            "property": "Intake Time",
-                            "date": {"on_or_after": target_date}
-                        }
-                    ]
-                }
+def cleanup_stale_today_relations():
+    """
+    Unlink the 'Today' relation from Calculator entries whose Intake Time < today.
+    This is the day-rollover mechanism: entries stay in the Calculator DB (= history)
+    but disappear from the 'Today' view (which filters by: Today relation is set).
+    """
+    today_iso = date.today().isoformat()
+    has_more = True
+    start_cursor = None
+    cleaned = 0
+
+    while has_more:
+        payload = {
+            "filter": {
+                "and": [
+                    {"property": "Today", "relation": {"is_not_empty": True}},
+                    {"property": "Intake Time", "date": {"before": today_iso}},
+                ]
             },
+            "page_size": 100,
+        }
+        if start_cursor:
+            payload["start_cursor"] = start_cursor
+
+        r = requests.post(
+            f"{NOTION_API}/databases/{CALCULATOR_DB}/query",
+            headers=NOTION_HEADERS,
+            json=payload,
         )
-        if r.status_code == 200:
-            print(f"    Today view filter updated to {target_date}")
-        else:
-            # Fallback: the filter was set via MCP and will need manual refresh
-            print(f"    Today view filter update skipped (API {r.status_code})")
-    except Exception as e:
-        print(f"    Today view filter update error: {e}")
+        if r.status_code != 200:
+            print(f"    Cleanup query failed ({r.status_code}); skipping")
+            return
+        data = r.json()
+        for page in data.get("results", []):
+            try:
+                notion_update_page(page["id"], {"Today": {"relation": []}})
+                cleaned += 1
+            except Exception as e:
+                print(f"    Failed to unlink {page['id'][:12]}: {e}")
+        has_more = data.get("has_more", False)
+        start_cursor = data.get("next_cursor")
+
+    if cleaned:
+        print(f"    Rolled over {cleaned} stale entries to History")
 
 
 def update_journal(page_id, nutrition):
@@ -490,9 +505,9 @@ def main():
         print(f"  FAIL Login failed: {e}")
         sys.exit(1)
 
-    # Update Today view filter to today's date
-    today_str = date.today().isoformat()
-    update_today_view_filter(today_str)
+    # Roll over yesterday's entries from "Today" view to "History" view
+    # by unlinking their Today relation
+    cleanup_stale_today_relations()
 
     # Sync
     success = 0
